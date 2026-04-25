@@ -1,0 +1,866 @@
+import cv2
+import numpy as np
+import time
+import threading
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+import os
+import pickle
+import face_recognition
+
+# =============================================================================
+# --- INITIALIZE FACIAL RECOGNITION (Caroline Dunn Method) ---
+# =============================================================================
+print("[INFO] Loading facial encodings...")
+data = pickle.loads(open("encodings.pickle", "rb").read())
+
+# Change this to the exact folder name you used when training your face!
+TARGET_NAME = {"Jden","Henry"}
+
+#os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+
+
+# =============================================================================
+# --- 1. TUNING & CONFIGURATION ---
+# =============================================================================
+SHOW_DISPLAY = True
+CAMERA_RES = (320, 240)
+
+# Motor Speeds
+BASE_SPEED = 35
+TURN_SPEED = 60
+U_TURN_SPEED = 60
+
+# PID Control
+Kp = 1.0
+Kd = 2.0
+
+# Line & Turn Detection
+THRESHOLD_VAL = 80
+SHARP_TURN_THRESHOLD = 70
+SHARP_TURN_CONFIRM = 2
+U_TURN_SENSITIVITY = 1500
+MAX_VALID_DELTA = 60
+
+# ROI Boundaries for Line Following
+ROI_TOP    = 120
+ROI_BOTTOM = 230
+ROI_LEFT   = 40
+ROI_RIGHT  = 280
+ROI_CX     = (ROI_RIGHT - ROI_LEFT) // 2
+
+# Vision System — kept strictly ABOVE the driving ROI
+VISION_TOP    = 0
+VISION_BOTTOM = 110
+
+# Shape confirmation: symbol must appear this many consecutive vision frames
+SHAPE_CONFIRM_FRAMES = 4
+# Top-hat kernel
+LINE_MAX_WIDTH = 45
+kernel_tophat = np.ones((LINE_MAX_WIDTH, LINE_MAX_WIDTH), np.uint8)
+
+# =============================================================================
+# --- 2. INITIALIZE ARUCO DETECTOR ---
+# =============================================================================
+aruco_dict   = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+aruco_params = cv2.aruco.DetectorParameters()
+detector     = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+
+# =============================================================================
+# --- 3. MOTOR SETUP ---
+# =============================================================================
+ENA, IN1, IN2 = 25, 24, 23
+IN3, IN4, ENB = 27, 17, 22
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([ENA, IN1, IN2, IN3, IN4, ENB], GPIO.OUT)
+
+pwm_left  = GPIO.PWM(ENA, 1000)
+pwm_right = GPIO.PWM(ENB, 1000)
+pwm_left.start(0)
+pwm_right.start(0)
+
+def set_motor(l_speed, r_speed):
+    l_speed = max(-100, min(100, l_speed))
+    r_speed = max(-100, min(100, r_speed))
+    GPIO.output(IN1, GPIO.HIGH if l_speed >= 0 else GPIO.LOW)
+    GPIO.output(IN2, GPIO.LOW  if l_speed >= 0 else GPIO.HIGH)
+    GPIO.output(IN3, GPIO.HIGH if r_speed >= 0 else GPIO.LOW)
+    GPIO.output(IN4, GPIO.LOW  if r_speed >= 0 else GPIO.HIGH)
+    pwm_left.ChangeDutyCycle(abs(l_speed))
+    pwm_right.ChangeDutyCycle(abs(r_speed))
+
+def stop():
+    pwm_left.ChangeDutyCycle(0)
+    pwm_right.ChangeDutyCycle(0)
+    GPIO.output([IN1, IN2, IN3, IN4], GPIO.LOW)
+
+def get_clean_roi(camera, follow_color=False):
+    img  = camera.capture_array()
+    roi_colour  = img[ROI_TOP:ROI_BOTTOM, ROI_LEFT:ROI_RIGHT]
+    
+    if follow_color:
+        hsv = cv2.cvtColor(roi_colour, cv2.COLOR_RGB2HSV)
+        mask = cv2.inRange(hsv, np.array([0, 164, 100]), np.array([179, 255, 245]))
+        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_tophat)
+    else:
+        gray = cv2.cvtColor(roi_colour, cv2.COLOR_RGB2GRAY)
+        _, thresh = cv2.threshold(gray, THRESHOLD_VAL, 255, cv2.THRESH_BINARY_INV)
+        return cv2.morphologyEx(thresh, cv2.MORPH_TOPHAT, kernel_tophat)
+
+def perform_turn(direction, camera, follow_color):
+    print(f"--- SHARP {direction.upper()} TURN ---")
+    stop()
+#     time.sleep(0.2)
+    if direction == "left":
+        set_motor(TURN_SPEED, -TURN_SPEED)
+    else:
+        set_motor(-TURN_SPEED, TURN_SPEED)
+    timeout = time.time() + 2.0
+
+    while time.time() < timeout:
+        if np.sum(get_clean_roi(camera, follow_color)[:, ROI_CX-10:ROI_CX+10] == 255) < 50:
+            break
+    while time.time() < timeout:
+        if np.sum(get_clean_roi(camera, follow_color)[:, ROI_CX-10:ROI_CX+10] == 255) > 150:
+            print("Line acquired!")
+            break
+    stop()
+#     time.sleep(0.3)
+
+def perform_u_turn(camera, prev_error):
+    print("--- U-TURN ---")
+    
+    # 1. Drive forward slightly to clear the gap/junction
+    set_motor(40, 40)
+    time.sleep(0.6)
+    
+    # 2. Check memory and spin towards the last known line position
+    if prev_error < 0:
+#         print("Line was on the LEFT! Spinning Left.")
+        set_motor(85, -85) # Your left-spin motor values
+    else:
+#         print("Line was on the RIGHT! Spinning Right.")
+        set_motor(-85, 85) # Your right-spin motor values
+        
+    time.sleep(0.4) # Blind spin to get off the original line
+
+    # 3. Setup the timeout for the safety loops
+    timeout = time.time() + 4.0
+
+    while time.time() < timeout:
+        if np.sum(get_clean_roi(camera) == 255) < 300:
+            break
+            
+    while time.time() < timeout:
+        clean_thresh = get_clean_roi(camera)
+        w = clean_thresh.shape[1]
+        if np.sum(clean_thresh[:, w//4:3*w//4] == 255) > 300:
+            print("U-Turn complete!")
+            break
+            
+    stop()
+    time.sleep(0.3)
+
+# =============================================================================
+# --- 4. VISION SYSTEM ---
+# =============================================================================
+def get_arrow_direction(mask, x, y, w, h):
+    box = mask[y:y+h, x:x+w]
+    
+    # Calculate weights for all 4 halves
+    top = cv2.countNonZero(box[0:h//2, :])
+    bot = cv2.countNonZero(box[h//2:, :])
+    lft = cv2.countNonZero(box[:, 0:w//2])
+    rgt = cv2.countNonZero(box[:, w//2:])
+    
+    # Calculate the aspect ratio (width divided by height)
+    aspect = w / float(h) if h > 0 else 1.0
+    
+    # 1. Narrow on Y-axis (Short and Wide) -> Must be Left or Right
+    if aspect > 1.3:
+        
+        return "LEFT" if lft > rgt else "RIGHT"
+        
+    # 2. Narrow on X-axis (Tall and Thin) -> Must be Up or Down
+    elif aspect < 0.75:
+        
+        return "UP" if top > bot else "DOWN"
+        
+    # 3. Roughly Squarish (0.9 to 1.1) -> Fallback to the heaviest difference
+    else:
+        if abs(top - bot) > abs(lft - rgt):
+            return "UP" if top > bot else "DOWN"
+        return "LEFT" if lft > rgt else "RIGHT"
+
+
+def detect_arrow(arrow_mask, annotated_image):
+    """
+    Detects arrows using convexity defects on thresholded contours.
+    Returns direction string like 'ARROW LEFT' or None.
+    """
+#     _, thresh = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(arrow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    for c in contours:
+        area = cv2.contourArea(c)
+#         print(area)
+        if area < 800 or area > 3000:
+            continue
+
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = w / float(h) if h > 0 else 0
+        if not (0.8 < aspect < 1.2):
+            continue
+        bbox_fill = area / float(w * h) if (w * h) > 0 else 0
+#         print(bbox_fill)
+        if bbox_fill < 0.3:
+            continue
+
+        hull_indices = cv2.convexHull(c, returnPoints=False)
+        if hull_indices is None or len(hull_indices) < 4:
+            continue
+        try:
+            defects = cv2.convexityDefects(c, hull_indices)
+        except Exception:
+            continue
+        if defects is None:
+            continue
+
+        min_defect_depth = 0.15 * max(w, h)
+        deep_defects = []
+        for i in range(defects.shape[0]):
+            s, e, f, depth = defects[i, 0]
+            if depth / 256.0 > min_defect_depth:
+                deep_defects.append(tuple(c[f][0]))
+
+        num_deep = len(deep_defects)
+        if 1 <= num_deep <= 3:
+            direction = get_arrow_direction(arrow_mask, x, y, w, h)
+            label = f"ARROW {direction}"
+            if SHOW_DISPLAY and annotated_image is not None:
+                cv2.drawContours(annotated_image, [c], -1, (0, 255, 0), 2)
+                cv2.putText(annotated_image, label, (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            return label
+
+    return None
+
+
+def process_vision(roi_image):
+    """
+    Classify the symbol in roi_image using colour/blob heuristics + ArUco + Arrow.
+
+    Priority order:
+      1. CAUTION   — yellow pixel ratio > 10 %,  H in [20, 35]
+      2. FINGER    — purple pixel ratio > 3 %,   H in [130, 160]
+      3. ARUCO     — cv2.aruco detector
+      4. GREENHAND — dark-green filled blob > 15 % of frame, H in [55, 85], V in [30, 160]
+      5. RECYCLE   — bright-green scattered blobs (2–6 pieces), H in [55, 85], V > 120
+      6. ARROW     — convexity defects (1–3 deep defects)
+    """
+    annotated_image = roi_image.copy() if SHOW_DISPLAY else None
+
+    hsv   = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
+    gray  = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
+    total_pixels = roi_image.shape[0] * roi_image.shape[1]
+
+    # ------------------------------------------------------------------
+    # 1. CAUTION — yellow card, H=20–35, bright yellow
+    # ------------------------------------------------------------------
+    caution_mask = cv2.inRange(hsv,np.array([8, 86, 110]), np.array([42, 255, 255]))
+    caution_ratio = cv2.countNonZero(caution_mask) / total_pixels
+
+   # print(f"Caution ratio: {caution_ratio}")
+    if caution_ratio > 0.20:
+#         if SHOW_DISPLAY and annotated_image is not None:
+#             cv2.putText(annotated_image, "CAUTION", (5, 20),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2)
+        return annotated_image, caution_mask, "CAUTION"
+
+    # ------------------------------------------------------------------
+    # 2. FINGER — purple/violet arcs, H=130–160
+    # ------------------------------------------------------------------
+    finger_mask = cv2.inRange(hsv, np.array([122, 52, 64]), np.array([152, 255, 255]))
+    finger_ratio = cv2.countNonZero(finger_mask) / total_pixels
+#     print(f"finger ratio: {finger_ratio}")
+
+    if finger_ratio > 0.01:
+#         if SHOW_DISPLAY and annotated_image is not None:
+#             cv2.putText(annotated_image, "FINGER", (5, 20),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 200), 2)
+        return annotated_image, finger_mask, "FINGER"
+
+    # ------------------------------------------------------------------
+    # 3. QR — purple/violet arcs, H=130–160
+    # ------------------------------------------------------------------
+    qr_mask = cv2.inRange(hsv, np.array([102, 98, 95]), np.array([132, 255, 255]))
+    qr_ratio = cv2.countNonZero(qr_mask) / total_pixels
+#     print(f"qr ratio: {qr_ratio}")
+    if qr_ratio > 0.05:
+#         if SHOW_DISPLAY and annotated_image is not None:
+#             cv2.putText(annotated_image, "FINGER", (5, 20),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 200), 2)
+        return annotated_image, qr_mask, "QR"
+    # ------------------------------------------------------------------
+    # 3. ARUCO — dark navy 4-block grid ---DEPRECIATED
+    # ------------------------------------------------------------------
+#     corners, ids, _ = detector.detectMarkers(gray)
+#     if ids is not None:
+# #         if SHOW_DISPLAY and annotated_image is not None:
+# #             cv2.aruco.drawDetectedMarkers(annotated_image, corners, ids)
+#         return annotated_image, gray, f"GRID ID: {ids[0][0]}"
+
+    # ------------------------------------------------------------------
+    # 4. GREENHAND/RECYCLE — large dark-green filled rectangle
+    #    more than 0.2 is green hand, between 0.07 and 0.2 is recycle
+    # ------------------------------------------------------------------
+    greenhand_mask = cv2.inRange(hsv, np.array([52, 43, 33]), np.array([105, 255, 255]))
+    greenhand_ratio = cv2.countNonZero(greenhand_mask) / total_pixels
+    
+#     print(f"Greenhand ratio: {greenhand_ratio}")
+    if greenhand_ratio > 0.2:
+#         if SHOW_DISPLAY and annotated_image is not None:
+#             cv2.putText(annotated_image, "GREENHAND", (5, 20),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 0), 2)
+        return annotated_image, greenhand_mask, "GREENHAND"
+    
+# ------------------------------------------------------------------
+    # 5. RECYCLE ORB - The "Donut Hole" Test
+    # ------------------------------------------------------------------
+    recycle_mask = cv2.inRange(hsv, np.array([67, 71, 55]), np.array([100, 255, 255]))
+    recycle_pixels = cv2.countNonZero(recycle_mask)
+    
+#     print(recycle_pixels)
+    # If we see enough green to be a sign (Arrow is 1100, Recycle is 2000, so >400 is safe)
+    if recycle_pixels > 500: 
+        # Find the giant box that surrounds ALL the green pixels
+        points = cv2.findNonZero(recycle_mask)
+        if points is not None:
+            rx, ry, rw, rh = cv2.boundingRect(points)
+            
+            # 1. Size Check (Ignore random floor noise)
+            if rw < 160 and rh < 160:
+                
+                # 2. THE DONUT HOLE TEST
+                # Find the exact center coordinates of the sign
+                cx = rx + (rw // 2)
+                cy = ry + (rh // 2)
+                
+                # Snip a tiny 10x10 pixel square directly out of the middle
+                center_slice = recycle_mask[max(0, cy-5):cy+5, max(0, cx-5):cx+5]
+                center_pixels = cv2.countNonZero(center_slice)
+                
+                # If the middle is completely empty paper (< 10 green pixels)...
+                # It is impossible to be an Arrow! It must be the hollow Recycle sign!
+#                 print(center_pixels)
+                if center_pixels < 10:
+                    if SHOW_DISPLAY and annotated_image is not None:
+                        cv2.rectangle(annotated_image, (rx, ry), (rx+rw, ry+rh), (0, 255, 255), 2)
+                        cv2.putText(annotated_image, f"RECYCLE ({recycle_pixels}px)", (rx, max(ry - 10, 0)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 100), 2)
+                    
+                    return annotated_image, recycle_mask, "RECYCLE"
+    # ------------------------------------------------------------------
+    # 5. RECYCLE — bright green scattered blobs (2–6 separate pieces)-----DEPRECIATED
+    #    H=55–85, V>120 (brighter than GREENHAND)
+    # ------------------------------------------------------------------
+#     recycle_mask = cv2.inRange(hsv, np.array([55, 60, 120]), np.array([85, 255, 255]))
+#     recycle_pixels = cv2.countNonZero(recycle_mask)
+#     if recycle_pixels > 200:
+#         contours, _ = cv2.findContours(recycle_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+#         valid_blobs = [c for c in contours if cv2.contourArea(c) > 80]
+#         if 2 <= len(valid_blobs) <= 6:
+#             if SHOW_DISPLAY and annotated_image is not None:
+#                 cv2.drawContours(annotated_image, valid_blobs, -1, (0, 255, 100), 2)
+#                 cv2.putText(annotated_image, "RECYCLE", (5, 20),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 100), 2)
+#             return annotated_image, recycle_mask, "RECYCLE"
+
+    # ------------------------------------------------------------------
+    # 6. ARROW — convexity defects (1–3 deep defects)
+    # ------------------------------------------------------------------
+    arrow_mask = cv2.inRange(hsv, np.array([0, 65, 81]), np.array([179, 255, 255]))
+#     arrow_ratio = cv2.countNonZero(arrow_mask) / total_pixels
+#     print(arrow_ratio)
+    arrow_result = detect_arrow(arrow_mask, annotated_image)
+    if arrow_result:
+        return annotated_image, arrow_mask, arrow_result
+
+    return annotated_image, gray, "NONE"
+
+
+# =============================================================================
+# --- 5. THREADED VISION SYSTEM ---
+# =============================================================================
+_vision_lock  = threading.Lock()
+# To this:
+_vision_state = {
+    "label":      "NONE",
+    "annotated":  None,
+    "mask":       None,   # <--- Add this!
+    "running":    True,
+}
+
+_shape_votes = {}
+
+def _vision_worker(camera):
+    global _shape_votes
+    while True:
+        with _vision_lock:
+            if not _vision_state["running"]:
+                break
+
+        frame = camera.capture_array()
+        vision_slice = frame[VISION_TOP:VISION_BOTTOM, 0:320]
+#         bgr_slice    = cv2.cvtColor(vision_slice, cv2.COLOR_RGB2BGR)
+
+        annotated, debug_mask, raw_label = process_vision(vision_slice)
+
+        if raw_label != "NONE":
+            _shape_votes[raw_label] = _shape_votes.get(raw_label, 0) + 1
+        else:
+            _shape_votes.clear()
+
+        confirmed_label = "NONE"
+        for lbl, count in _shape_votes.items():
+            if count >= SHAPE_CONFIRM_FRAMES:
+                confirmed_label = lbl
+                break
+
+        with _vision_lock:
+#             _vision_state["label"]     = confirmed_label
+            _vision_state["label"]     = raw_label
+            _vision_state["annotated"] = annotated
+            _vision_state["mask"]      = debug_mask  # <--- Add this!
+
+def start_vision_thread(camera):
+    t = threading.Thread(target=_vision_worker, args=(camera,), daemon=True)
+    t.start()
+    return t
+
+
+# =============================================================================
+# --- 6. MAIN EXECUTION LOOP ---
+# =============================================================================
+picam2 = Picamera2()
+config = picam2.create_video_configuration(
+    main={"size": CAMERA_RES, "format": "RGB888"},
+    controls={"FrameDurationLimits": (16667, 16667)}  # 60fps
+)
+picam2.configure(config)
+picam2.start()
+time.sleep(2)
+
+picam2.set_controls({
+    "AeEnable": False,  # Turns off Auto Exposure (brightness)
+    "AwbEnable": False  # Turns off Auto White Balance (color shifting)
+})
+
+print("Camera brightness and colors LOCKED!")
+
+print("\n--- ROBOT BRAIN ACTIVE (colour-based vision) ---")
+
+prev_cx = ROI_CX
+prev_error = 0
+sharp_turn_count = 0
+sharp_turn_dir   = None
+
+fps_counter = 0
+fps_timer   = time.time()
+
+last_symbol     = "NONE"
+symbol_cooldown = 0
+resume_time     = 0
+clean_thresh    = None
+
+recycle_count = 0
+
+# --- SHORTCUT MEMORY VARIABLES ---
+on_shortcut = False
+shortcut_exit_turn = "right" # Fallback default
+last_known_turn = "right"    # Tracks the most recent sharp turn
+last_color_entry = 0
+entry_flag = False
+
+# ---------------------------------
+
+vision_thread = start_vision_thread(picam2)
+
+try:
+    while True:
+        with _vision_lock:
+            status_label = _vision_state["label"]
+            result_view  = _vision_state["annotated"]
+            vision_mask  = _vision_state["mask"]
+        if status_label != "NONE" and time.time() > symbol_cooldown:
+#             if status_label != last_symbol:
+            print(f">>> SYMBOL CONFIRMED: {status_label}")
+            last_symbol     = status_label
+            symbol_cooldown = time.time() + 6.0  # longer than any action duration
+
+            if status_label != "RECYCLE":
+                recycle_count = 0
+
+            if status_label in ("CAUTION", "GREENHAND"):
+                print("confirm greenhand")
+                stop()
+                time.sleep(2)
+                set_motor(40, 40)
+                time.sleep(0.6)
+                stop()
+
+            elif status_label == "RECYCLE":
+                print("confirm recycle")
+                recycle_count = 0
+                stop()
+                time.sleep(0.5)
+                
+                    # Phase 1: blind spin get away from original line
+                set_motor(70, -70)
+                time.sleep(1.8)  # tune this just enough to clear the original line
+                    
+                    # Phase 2: keep spinning but now check for new line
+                timeout = time.time() + 3.0  # safety timeout so it doesn't spin forever
+                while time.time() < timeout:
+                    line_view = get_clean_roi(picam2)
+                    center_strip = line_view[:, ROI_CX-15:ROI_CX+15]
+                    if np.sum(center_strip == 255) > 100:  # line detected in centre
+                        print("New line acquired after recycle spin!")
+                        break
+                    
+                stop()
+                time.sleep(0.2)
+                set_motor(20, 40)
+                time.sleep(0.8)
+                stop()
+# 1. FINGER & QR (True AI Facial Recognition)
+            elif status_label in ("FINGER", "QR"):
+                print(f"\n--- {status_label} TRIGGERED! Lifting Robot for ID Verification ---")
+                stop() 
+                time.sleep(0.5)
+                
+                recognized_target = False
+                timeout = time.time() + 20.0 # 10 seconds to verify identity
+                
+                while time.time() < timeout:
+                    # picam2 outputs RGB natively, perfect for face_recognition!
+                    frame = picam2.capture_array() 
+                    
+                    # 1. Find all face boxes in the frame
+                    boxes = face_recognition.face_locations(frame, model="hog")
+                    # 2. Compute the facial embeddings for each face
+                    encodings = face_recognition.face_encodings(frame, boxes)
+                    
+                    names = []
+                    
+                    # Loop over the facial embeddings
+                    for encoding in encodings:
+                        # Compare the face to our known encodings.pickle
+                        matches = face_recognition.compare_faces(data["encodings"], encoding)
+                        name = "Unknown"
+                        
+                        if True in matches:
+                            matchedIdxs = [i for (i, b) in enumerate(matches) if b]
+                            counts = {}
+                            
+                            for i in matchedIdxs:
+                                name = data["names"][i]
+                                counts[name] = counts.get(name, 0) + 1
+                                
+                            # Pick the name with the most "votes"
+                            name = max(counts, key=counts.get)
+                            
+                        names.append(name)
+                        
+                    # --- VISUALIZATION & CONFIRMATION ---
+                    # Convert to BGR just for the cv2 display window
+                    display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    
+                    for ((top, right, bottom, left), name) in zip(boxes, names):
+                        # Draw the box and the name on the screen
+                        color = (0, 255, 0) if name == TARGET_NAME else (0, 0, 255)
+                        cv2.rectangle(display_frame, (left, top), (right, bottom), color, 2)
+                        cv2.putText(display_frame, name, (left, top - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+                        cv2.waitKey(1000)
+                        # If it's you, trigger the success!
+                        if name in TARGET_NAME:
+                            recognized_target = True
+                            
+                    cv2.imshow("Security Scanner", display_frame)
+                    cv2.waitKey(1)
+                    
+                    if recognized_target:
+                        print(f">>> ACCESS GRANTED: Welcome {name}! <<<")
+                        cv2.rectangle(display_frame, (0, 0), (display_frame.shape[1], display_frame.shape[0]), (0, 255, 0), 10)
+                        cv2.putText(display_frame, "VERIFIED", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
+                        cv2.imshow("Security Scanner", display_frame)
+                        cv2.waitKey(2000)
+                        break
+                        
+                cv2.destroyWindow("Security Scanner")
+                
+                if not recognized_target:
+                    print(">>> ACCESS DENIED: Identity not verified or timeout. <<<")
+                    
+#                 cooldowns[status_label] = time.time() + 5.0
+                print("Putting robot back down. Resuming patrol...\n")
+#                 
+                
+                
+            
+            elif status_label in {"ARROW RIGHT", "ARROW LEFT"}:
+                if status_label == "ARROW RIGHT":
+                    set_motor(40,40)
+                    time.sleep(0.6)
+                    set_motor(-75, 75)
+                    time.sleep(0.4)
+                    
+                    # Keep spinning right while looking for a new line
+                    timeout = time.time() + 3.0
+                    while time.time() < timeout:
+                        line_view = get_clean_roi(picam2)
+                        center_strip = line_view[:, ROI_CX-15:ROI_CX+15]
+                        if np.sum(center_strip == 255) > 100:
+                          
+                            print("New line acquired after RIGHT arrow spin!")
+                            stop()
+                            time.sleep(0.2)
+                            break
+                        
+                        set_motor(-TURN_SPEED, TURN_SPEED)  # keep spinning right
+                    
+                    stop()
+                    time.sleep(0.2)
+                    set_motor(40, 40)
+                    time.sleep(0.4)
+                    stop()
+
+                elif status_label == "ARROW LEFT":
+                    set_motor(40,40)
+                    time.sleep(0.6)
+                    set_motor(75, -75)
+                    time.sleep(0.4)
+                    
+                    # Keep spinning left while looking for a new line
+                    timeout = time.time() + 1.0
+                    while time.time() < timeout:
+                        line_view = get_clean_roi(picam2)
+                        center_strip = line_view[:, ROI_CX-15:ROI_CX+15]
+                        if np.sum(center_strip == 255) > 100:
+#                             print(f"White pixels: {white_count}")
+                            print("New line acquired after LEFT arrow spin!")
+                            stop()
+                            time.sleep(0.4)
+                            break
+                        set_motor(TURN_SPEED, -TURN_SPEED)  # keep spinning left
+                    
+                    stop()
+                    time.sleep(0.2)
+                    set_motor(40, 40)
+                    time.sleep(0.4)
+                    stop()
+                    
+            elif status_label =="ARROW UP":
+                print("drive straight arow up")
+                set_motor(40,40)
+                time.sleep(0.5)
+                stop()
+                time.sleep(0.2)
+                    
+                    
+# ------------------------------------------------------------------
+        # LINE FOLLOWING & MOTOR CONTROL
+        # ------------------------------------------------------------------
+        frame      = picam2.capture_array()
+        roi_colour = frame[ROI_TOP:ROI_BOTTOM, ROI_LEFT:ROI_RIGHT].copy()
+
+        if time.time() < resume_time:
+            # stop()
+            prev_error = 0
+            if SHOW_DISPLAY and result_view is not None:
+                cv2.putText(result_view, "PAUSED: IDENTIFYING...", (5, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        else:
+            # 1. Standard Black Line Mask
+            gray_roi = cv2.cvtColor(roi_colour, cv2.COLOR_RGB2GRAY)
+            _, raw_thresh = cv2.threshold(gray_roi, THRESHOLD_VAL, 255, cv2.THRESH_BINARY_INV)
+            black_thresh = cv2.morphologyEx(raw_thresh, cv2.MORPH_TOPHAT, kernel_tophat)
+            
+            # 2. Colored Shortcut Mask (Red/Yellow)
+            hsv_roi = cv2.cvtColor(roi_colour, cv2.COLOR_RGB2HSV)
+            color_thresh = cv2.inRange(hsv_roi, np.array([0, 143, 148]), np.array([179, 255, 255]))
+#             color_thresh = cv2.morphologyEx(color_mask_raw, cv2.MORPH_OPEN, kernel_tophat)
+            
+            # 3. Count the pixels
+            black_pixels = cv2.countNonZero(black_thresh)
+            color_pixels = cv2.countNonZero(color_thresh)
+#             print("blackpixels=",black_pixels)
+#             print("colorpixels",color_pixels)
+#             cv2.imshow("color_pixl",color_thresh)
+
+# --- SHORTCUT ENTRY & EXIT LOGIC ---
+            if time.time()-last_color_entry < 1:
+                color_pixels = 501
+                
+            if color_pixels > 500:
+                if not entry_flag:
+                    entry_flag = True
+                    last_color_entry = time.time()
+                
+                clean_thresh = color_thresh
+                if not on_shortcut:
+                    on_shortcut = True
+                    
+# --- NEW MEMORY LOGIC: The "Bumper" Slice ---
+                    h, w = black_thresh.shape
+                    
+                    # We ONLY look at the bottom 40% of the image (closest to the tires)
+                    # This makes the robot completely blind to the sweeping curves in the distance!
+                    bottom_start = int(h * 0.6)
+                    
+                    bottom_black = black_thresh[bottom_start:, :]
+                    bottom_color = color_thresh[bottom_start:, :]
+                    
+                    # 1. Find the exact X-center of the Black Line near the bumper
+                    black_cols = np.sum(bottom_black / 255.0, axis=0)
+                    b_weight = np.sum(black_cols)
+                    # If black line is already gone from the bumper, default to the center of the screen
+                    black_cx = int(np.sum(np.arange(w) * black_cols) / b_weight) if b_weight > 0 else w // 2
+                    
+                    # 2. Find the exact X-center of the Colored Line near the bumper
+                    color_cols = np.sum(bottom_color / 255.0, axis=0)
+                    c_weight = np.sum(color_cols)
+                    # If color line isn't at the bumper yet, default to center
+                    color_cx = int(np.sum(np.arange(w) * color_cols) / c_weight) if c_weight > 0 else w // 2
+                    
+                    # 3. Compare the stems of the lines!
+                    if color_cx > black_cx:
+                        shortcut_exit_turn = "right"
+                    else:
+                        shortcut_exit_turn = "left"
+                    # ---------------------------------------------------
+                    
+                    print(f"--- FORK DETECTED! Bumper Red CX:{color_cx} vs Black CX:{black_cx} -> Memorized: {shortcut_exit_turn.upper()} ---")
+            else:
+                clean_thresh = black_thresh
+                entry_flag = False
+                # If we were on a shortcut, and black suddenly overtakes color...
+                if on_shortcut and black_pixels > color_pixels + 300:
+                    print(f"--- EXITING SHORTCUT! Forcing {shortcut_exit_turn.upper()} turn ---")
+                    # Force the memorized turn to get back on the main track
+                    set_motor(40,40)
+                    time.sleep(0.5)
+                    perform_turn(shortcut_exit_turn, picam2, follow_color=False)
+                    on_shortcut = False
+                    prev_cx = ROI_CX
+                    prev_error = 0
+                    continue # Skip the rest of this frame to start fresh
+            # -----------------------------------
+
+            roi_w = clean_thresh.shape[1]
+            left_count  = np.sum(clean_thresh[:, 0:roi_w//6] == 255)
+            right_count = np.sum(clean_thresh[:, roi_w - roi_w//6:] == 255)
+
+            if left_count > U_TURN_SENSITIVITY and right_count > U_TURN_SENSITIVITY:
+                perform_u_turn(picam2, prev_error)
+                prev_cx = ROI_CX; prev_error = 0; sharp_turn_count = 0
+            else:
+                normalized_thresh = clean_thresh / 255.0
+                column_sums  = np.sum(normalized_thresh, axis=0)
+                total_weight = np.sum(column_sums)
+
+                if total_weight > 0:
+                    indices = np.arange(roi_w)
+                    cx      = int(np.sum(indices * column_sums) / total_weight)
+                    delta   = cx - prev_cx
+
+                    if abs(delta) > MAX_VALID_DELTA:
+                        cx = prev_cx
+                        delta = 0
+
+                    if abs(delta) > SHARP_TURN_THRESHOLD:
+                        direction = "left" if delta < 0 else "right"
+                        if direction == sharp_turn_dir:
+                            sharp_turn_count += 1
+                        else:
+                            sharp_turn_dir   = direction
+                            sharp_turn_count = 1
+
+                        if sharp_turn_count >= SHARP_TURN_CONFIRM:
+                            sharp_turn_count = 0
+                            sharp_turn_dir   = None
+                            prev_error       = 0
+                            last_known_turn = direction
+                            perform_turn(direction, picam2, follow_color=on_shortcut)
+                            prev_cx = ROI_CX
+                    else:
+                        sharp_turn_count = 0
+                        error      = cx - ROI_CX
+                        correction = (Kp * error) + (Kd * (error - prev_error))
+                        set_motor(BASE_SPEED - correction, BASE_SPEED + correction)
+                        prev_cx    = cx
+                        prev_error = error
+
+                        if SHOW_DISPLAY:
+                            cv2.circle(roi_colour, (cx, roi_colour.shape[0]//2), 8, (0, 255, 0), -1)
+                            cv2.line(roi_colour, (ROI_CX, 0), (ROI_CX, roi_colour.shape[0]), (0, 0, 255), 1)
+                else:
+                    # ---> AUTO-RECOVERY WHEN LINE IS COMPLETELY LOST <---
+#                     print("LINE LOST! Auto-recovering...")
+                    if prev_error < 0:
+#                         print("Line was on the LEFT! Spinning Left.")
+                        set_motor(90, -90) # Spin Left to find it
+                    else:
+#                         print("Line was on the RIGHT! Spinning Right.")
+                        set_motor(-90, 90) # Spin Right to find it
+
+        # ------------------------------------------------------------------
+        # METRICS & DISPLAY
+        # ------------------------------------------------------------------
+        fps_counter += 1
+        if time.time() - fps_timer >= 2.0:
+            print(f"FPS: {fps_counter / 2:.1f}")
+            fps_counter = 0
+            fps_timer   = time.time()
+
+        if SHOW_DISPLAY:
+            if clean_thresh is not None:
+                cv2.imshow("1. Clean Driving Line", clean_thresh)
+
+            if result_view is not None:
+                color = (0, 255, 0) if status_label != "NONE" else (0, 0, 255)
+                cv2.putText(result_view, f"STATUS: {status_label}", (5, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.imshow("2. Vision Target", result_view)
+                
+
+                    
+                
+            if vision_mask is not None:
+                cv2.imshow("4. Color Mask Debug", vision_mask)
+
+#             cv2.imshow("3. Robot Eyes", cv2.cvtColor(roi_colour, cv2.COLOR_RGB2BGR))
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    with _vision_lock:
+        _vision_state["running"] = False
+    stop()
+    picam2.stop()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
+    print("Done.")
+
+
+
+
+
